@@ -2,12 +2,14 @@ import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueExecutionDecisions } from "@paperclipai/db";
+import { activityLog, issueExecutionDecisions } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
   cancelIssueThreadInteractionSchema,
+  companySearchQuerySchema,
   createIssueAttachmentMetadataSchema,
   createIssueThreadInteractionSchema,
   createIssueWorkProductSchema,
@@ -31,7 +33,10 @@ import {
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  type CompanySearchQuery,
+  type CompanySearchResponse,
   type ExecutionWorkspace,
+  type SuccessfulRunHandoffState,
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -42,6 +47,7 @@ import {
   accessService,
   agentService,
   companyService,
+  companySearchService,
   executionWorkspaceService,
   goalService,
   heartbeatService,
@@ -78,6 +84,11 @@ import { executionWorkspaceService as executionWorkspaceServiceDirect } from "..
 import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { environmentService } from "../services/environments.js";
+import { redactSensitiveText } from "../redaction.js";
+import {
+  createCompanySearchRateLimiter,
+  type CompanySearchRateLimiter,
+} from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
   normalizeIssueExecutionPolicy,
@@ -94,6 +105,9 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
 
 type ParsedExecutionState = NonNullable<ReturnType<typeof parseIssueExecutionState>>;
 type NormalizedExecutionPolicy = NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>;
+type CompanySearchService = {
+  search(companyId: string, query: CompanySearchQuery): Promise<CompanySearchResponse>;
+};
 type ActivityIssueRelationSummary = {
   id: string;
   identifier: string | null;
@@ -113,6 +127,105 @@ type ExecutionStageWakeContext = {
   lastDecisionOutcome: ParsedExecutionState["lastDecisionOutcome"];
   allowedActions: string[];
 };
+type SuccessfulRunHandoffActivityRow = {
+  entityId: string;
+  action: string;
+  agentId: string | null;
+  runId: string | null;
+  details: Record<string, unknown> | null;
+  createdAt: Date;
+};
+
+const SUCCESSFUL_RUN_HANDOFF_ACTIONS = [
+  "issue.successful_run_handoff_required",
+  "issue.successful_run_handoff_resolved",
+  "issue.successful_run_handoff_escalated",
+] as const;
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function successfulRunHandoffStateFromActivity(row: {
+  action: string;
+  agentId: string | null;
+  runId: string | null;
+  details: Record<string, unknown> | null;
+  createdAt: Date;
+}): SuccessfulRunHandoffState | null {
+  const details = row.details ?? {};
+  const state =
+    row.action === "issue.successful_run_handoff_required"
+      ? "required"
+      : row.action === "issue.successful_run_handoff_resolved"
+        ? "resolved"
+        : row.action === "issue.successful_run_handoff_escalated"
+          ? "escalated"
+          : null;
+  if (!state) return null;
+
+  const detectedProgressSummary =
+    readNonEmptyString(details.detectedProgressSummary)
+    ?? readNonEmptyString(details.detected_progress_summary)
+    ?? null;
+
+  return {
+    state,
+    required: state === "required",
+    sourceRunId:
+      readNonEmptyString(details.sourceRunId)
+      ?? readNonEmptyString(details.source_run_id)
+      ?? readNonEmptyString(details.resumeFromRunId)
+      ?? row.runId
+      ?? null,
+    correctiveRunId:
+      readNonEmptyString(details.correctiveRunId)
+      ?? readNonEmptyString(details.corrective_run_id)
+      ?? (state !== "required" ? row.runId : null),
+    assigneeAgentId:
+      readNonEmptyString(details.assigneeAgentId)
+      ?? readNonEmptyString(details.agentId)
+      ?? row.agentId
+      ?? null,
+    detectedProgressSummary: detectedProgressSummary
+      ? redactSensitiveText(detectedProgressSummary)
+      : null,
+    createdAt: row.createdAt,
+  };
+}
+
+async function listSuccessfulRunHandoffStates(
+  db: Db,
+  companyId: string,
+  issueIds: string[],
+): Promise<Map<string, SuccessfulRunHandoffState>> {
+  if (issueIds.length === 0) return new Map();
+  const rows = await db
+    .select({
+      entityId: activityLog.entityId,
+      action: activityLog.action,
+      agentId: activityLog.agentId,
+      runId: activityLog.runId,
+      details: activityLog.details,
+      createdAt: activityLog.createdAt,
+    })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, companyId),
+      eq(activityLog.entityType, "issue"),
+      inArray(activityLog.entityId, issueIds),
+      inArray(activityLog.action, [...SUCCESSFUL_RUN_HANDOFF_ACTIONS]),
+    ))
+    .orderBy(activityLog.entityId, desc(activityLog.createdAt), desc(activityLog.id)) as SuccessfulRunHandoffActivityRow[];
+
+  const states = new Map<string, SuccessfulRunHandoffState>();
+  for (const row of rows) {
+    if (states.has(row.entityId)) continue;
+    const state = successfulRunHandoffStateFromActivity(row);
+    if (state) states.set(row.entityId, state);
+  }
+  return states;
+}
 
 function executionPrincipalsEqual(
   left: ParsedExecutionState["currentParticipant"] | null,
@@ -148,6 +261,23 @@ function summarizeIssueRelationForActivity(relation: {
     id: relation.id,
     identifier: relation.identifier,
     title: relation.title,
+  };
+}
+
+const defaultCompanySearchRateLimiter = createCompanySearchRateLimiter();
+
+function companySearchRateLimitActor(req: Request, companyId: string) {
+  if (req.actor.type === "agent") {
+    return {
+      companyId,
+      actorType: "agent" as const,
+      actorId: req.actor.agentId ?? req.actor.keyId ?? "unknown-agent",
+    };
+  }
+  return {
+    companyId,
+    actorType: "board" as const,
+    actorId: req.actor.userId ?? req.actor.source ?? "board",
   };
 }
 
@@ -446,6 +576,8 @@ export function issueRoutes(
         now?: Date;
       }): Promise<unknown>;
     };
+    searchService?: CompanySearchService;
+    searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
   } = {},
 ) {
@@ -457,6 +589,12 @@ export function issueRoutes(
   });
   const feedback = feedbackService(db);
   const companiesSvc = companyService(db);
+  let searchSvc = opts.searchService ?? null;
+  const getSearchService = () => {
+    searchSvc ??= companySearchService(db);
+    return searchSvc;
+  };
+  const searchRateLimiter = opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
   const projectsSvc = projectService(db);
@@ -946,6 +1084,25 @@ export function issueRoutes(
     });
   });
 
+  router.get("/companies/:companyId/search", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const query = companySearchQuerySchema.parse(req.query);
+    const rateLimit = searchRateLimiter.consume(companySearchRateLimitActor(req, companyId));
+    res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
+    res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
+    if (!rateLimit.allowed) {
+      res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
+      res.status(429).json({
+        error: "Search rate limit exceeded",
+        retryAfterSeconds: rateLimit.retryAfterSeconds,
+      });
+      return;
+    }
+    const result = await getSearchService().search(companyId, query);
+    res.json(result);
+  });
+
   router.get("/companies/:companyId/issues", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -1033,7 +1190,15 @@ export function issueRoutes(
       limit,
       offset,
     });
-    res.json(result);
+    const handoffStates = await listSuccessfulRunHandoffStates(
+      db,
+      companyId,
+      result.map((issue) => issue.id),
+    );
+    res.json(result.map((issue) => ({
+      ...issue,
+      successfulRunHandoff: handoffStates.get(issue.id) ?? null,
+    })));
   });
 
   router.get("/companies/:companyId/labels", async (req, res) => {
@@ -1139,6 +1304,7 @@ export function issueRoutes(
         title: issue.title,
         description: issue.description,
         status: issue.status,
+        workMode: issue.workMode,
         ...(blockerAttention ? { blockerAttention } : {}),
         productivityReview,
         priority: issue.priority,
@@ -1221,6 +1387,7 @@ export function issueRoutes(
       blockerAttention,
       productivityReview,
       referenceSummary,
+      successfulRunHandoffStates,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -1230,6 +1397,7 @@ export function issueRoutes(
       svc.listBlockerAttention(issue.companyId, [issue]).then((map) => map.get(issue.id) ?? null),
       svc.listProductivityReviews(issue.companyId, [issue.id]).then((map) => map.get(issue.id) ?? null),
       issueReferencesSvc.listIssueReferenceSummary(issue.id),
+      listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id]),
     ]);
     const mentionedProjects = mentionedProjectIds.length > 0
       ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
@@ -1244,6 +1412,7 @@ export function issueRoutes(
       ancestors,
       ...(blockerAttention ? { blockerAttention } : {}),
       productivityReview,
+      successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
       blockedBy: relations.blockedBy,
       blocks: relations.blocks,
       relatedWork: referenceSummary,
@@ -2434,6 +2603,33 @@ export function issueRoutes(
         ),
       },
     });
+
+    if (existing.status === "in_progress" && issue.status !== existing.status && issue.status !== "in_progress") {
+      await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id])
+        .then(async (handoffStates) => {
+          const handoff = handoffStates.get(issue.id);
+          if (handoff?.state !== "required") return;
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: "issue.successful_run_handoff_resolved",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              identifier: issue.identifier,
+              sourceRunId: handoff.sourceRunId,
+              correctiveRunId: handoff.correctiveRunId,
+              resolvedByStatus: issue.status,
+            },
+          });
+        })
+        .catch((err) => {
+          logger.warn({ err, issueId: issue.id }, "failed to log successful run handoff resolution");
+        });
+    }
 
     if (Array.isArray(req.body.blockedByIssueIds)) {
       const previousBlockedByIds = new Set((existingRelations?.blockedBy ?? []).map((relation) => relation.id));
@@ -3688,6 +3884,10 @@ export function issueRoutes(
       agentId: actor.agentId ?? undefined,
       userId: actor.actorType === "user" ? actor.actorId : undefined,
       runId: actor.runId,
+    }, {
+      authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
+      presentation: req.body.presentation ?? null,
+      metadata: req.body.metadata ?? null,
     });
     await issueReferencesSvc.syncComment(comment.id);
     const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
