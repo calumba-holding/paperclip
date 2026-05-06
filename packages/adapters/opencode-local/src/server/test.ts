@@ -12,6 +12,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
+  maybeRunSandboxInstallCommand,
   ensureAdapterExecutionTargetDirectory,
   runAdapterExecutionTargetProcess,
   describeAdapterExecutionTarget,
@@ -19,6 +20,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import { discoverOpenCodeModels, ensureOpenCodeModelConfiguredAndAvailable } from "./models.js";
 import { parseOpenCodeJsonl } from "./parse.js";
+import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
@@ -136,6 +138,15 @@ export async function testEnvironment(
         detail: command,
       });
     } else {
+      const installCheck = await maybeRunSandboxInstallCommand({
+        runId,
+        target,
+        adapterKey: "opencode",
+        installCommand: SANDBOX_INSTALL_COMMAND,
+    detectCommand: command,
+        env,
+      });
+      if (installCheck) checks.push(installCheck);
       try {
         await ensureAdapterExecutionTargetCommandResolvable(command, target, cwd, runtimeEnv);
         checks.push({
@@ -279,13 +290,6 @@ export async function testEnvironment(
       if (variant) args.push("--variant", variant);
       if (extraArgs.length > 0) args.push(...extraArgs);
 
-      // For remote targets, do NOT spread the host process.env into the
-      // probe env: it leaks macOS-only paths (HOME=/Users/..., host
-      // XDG_CONFIG_HOME, TMPDIR, etc.) into the remote shell, which causes
-      // opencode on the remote box to try to mkdir host paths like /Users.
-      // Match the pattern used by claude_local / codex_local / gemini_local
-      // probes: send only the user-configured adapter env across SSH.
-      const probeEnv = targetIsRemote ? preparedRuntimeConfig.env : runtimeEnv;
       try {
         const probe = await runAdapterExecutionTargetProcess(
           runId,
@@ -294,7 +298,7 @@ export async function testEnvironment(
           args,
           {
             cwd,
-            env: probeEnv,
+            env: runtimeEnv,
             timeoutSec: 60,
             graceSec: 5,
             stdin: "Respond with hello.",
