@@ -85,9 +85,19 @@
     "publishFromCi": true
   },
   {
+    "dir": "packages/plugins/sandbox-providers/cloudflare",
+    "name": "@paperclipai/plugin-cloudflare-sandbox",
+    "publishFromCi": false
+  },
+  {
     "dir": "packages/plugins/sandbox-providers/daytona",
     "name": "@paperclipai/plugin-daytona",
     "publishFromCi": true
+  },
+  {
+    "dir": "packages/plugins/sandbox-providers/exe-dev",
+    "name": "@paperclipai/plugin-exe-dev",
+    "publishFromCi": false
   },
   {
     "dir": "packages/plugins/sandbox-providers/e2b",
