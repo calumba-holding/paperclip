@@ -579,6 +579,11 @@ export interface IssueComment {
   body: string;
   presentation: IssueCommentPresentation | null;
   metadata: IssueCommentMetadata | null;
+  deletedAt?: Date | null;
+  deletedByType?: "agent" | "user" | null;
+  deletedByAgentId?: string | null;
+  deletedByUserId?: string | null;
+  deletedByRunId?: string | null;
   followUpRequested?: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -722,6 +727,7 @@ export interface AskUserQuestionsPayload {
 export interface AskUserQuestionsAnswer {
   questionId: string;
   optionIds: string[];
+  otherText?: string | null;
 }
 
 export interface AskUserQuestionsResult {

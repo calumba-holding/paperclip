@@ -1193,6 +1193,13 @@ export function issueRoutes(
     return value === true || value === "true" || value === "1";
   }
 
+  function parseOptionalBooleanQuery(value: unknown) {
+    if (value === undefined) return undefined;
+    if (value === true || value === "true" || value === "1") return true;
+    if (value === false || value === "false" || value === "0") return false;
+    return null;
+  }
+
   function shouldIncludeDocumentAnnotations(req: Request) {
     if (req.query.includeAnnotations === "false" || req.query.includeAnnotations === "0") return false;
     return req.actor.type === "agent" || parseBooleanQuery(req.query.includeAnnotations);
@@ -1993,6 +2000,7 @@ export function issueRoutes(
     const attention = req.query.attention as string | undefined;
     const sortField = req.query.sortField as string | undefined;
     const sortDir = req.query.sortDir as string | undefined;
+    const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
 
     if (assigneeUserFilterRaw === "me" && (!assigneeUserId || req.actor.type !== "board")) {
       res.status(403).json({ error: "assigneeUserId=me requires board authentication" });
@@ -2030,6 +2038,10 @@ export function issueRoutes(
       res.status(400).json({ error: "sortDir must be 'asc' or 'desc' when provided" });
       return;
     }
+    if (hasPlanDocument === null) {
+      res.status(400).json({ error: "hasPlanDocument must be true or false when provided" });
+      return;
+    }
     const offset = parsedOffset ?? 0;
 
     const result = await svc.list(companyId, {
@@ -2059,6 +2071,7 @@ export function issueRoutes(
       includeBlockedBy: req.query.includeBlockedBy === "true" || req.query.includeBlockedBy === "1",
       includeBlockedInboxAttention:
         req.query.includeBlockedInboxAttention === "true" || req.query.includeBlockedInboxAttention === "1",
+      hasPlanDocument,
       q: req.query.q as string | undefined,
       limit,
       offset,
@@ -2094,12 +2107,17 @@ export function issueRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const attention = req.query.attention as string | undefined;
+    const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
     if (attention !== "blocked") {
       res.status(400).json({ error: "issues/count currently requires attention=blocked" });
       return;
     }
     if (req.query.limit !== undefined || req.query.offset !== undefined) {
       res.status(400).json({ error: "issues/count does not accept limit or offset" });
+      return;
+    }
+    if (hasPlanDocument === null) {
+      res.status(400).json({ error: "hasPlanDocument must be true or false when provided" });
       return;
     }
 
@@ -2126,6 +2144,7 @@ export function issueRoutes(
         req.query.includePluginOperations === "true" || req.query.includePluginOperations === "1",
       includeBlockedBy: true,
       includeBlockedInboxAttention: true,
+      hasPlanDocument,
       q: req.query.q as string | undefined,
     });
     res.json({ count });
@@ -5615,24 +5634,93 @@ export function issueRoutes(
       actor.actorType === "agent"
         ? comment.authorAgentId === actor.agentId
         : comment.authorUserId === actor.actorId;
-    if (!actorOwnsComment) {
-      res.status(403).json({ error: "Only the comment author can cancel queued comments" });
-      return;
-    }
+    const deleteMode = req.query.mode === "cancel" ? "cancel" : "delete";
 
     const activeRun = await resolveActiveIssueRun(issue);
-    if (!activeRun) {
-      res.status(409).json({ error: "Queued comment can no longer be canceled" });
+    const isQueuedComment = activeRun ? isQueuedIssueCommentForActiveRun({ comment, activeRun }) : false;
+    if (deleteMode === "cancel" || isQueuedComment) {
+      if (!actorOwnsComment) {
+        res.status(403).json({ error: "Only the comment author can cancel queued comments" });
+        return;
+      }
+
+      if (!activeRun) {
+        res.status(409).json({ error: "Queued comment can no longer be canceled" });
+        return;
+      }
+
+      if (!isQueuedComment) {
+        res.status(409).json({ error: "Only queued comments can be canceled" });
+        return;
+      }
+
+      const removed = await svc.removeComment(commentId);
+      if (!removed) {
+        res.status(404).json({ error: "Comment not found" });
+        return;
+      }
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.comment_cancelled",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          commentId: removed.id,
+          bodySnippet: removed.body.slice(0, 120),
+          identifier: issue.identifier,
+          issueTitle: issue.title,
+          source: "queue_cancel",
+          queueTargetRunId: activeRun.id,
+        },
+      });
+
+      res.json(removed);
       return;
     }
 
-    if (!isQueuedIssueCommentForActiveRun({ comment, activeRun })) {
-      res.status(409).json({ error: "Only queued comments can be canceled" });
+    if (!actorOwnsComment) {
+      res.status(403).json({ error: "Only the comment author can delete comments" });
       return;
     }
 
-    const removed = await svc.removeComment(commentId);
-    if (!removed) {
+    if (comment.deletedAt) {
+      res.json(comment);
+      return;
+    }
+
+    let annotationCleanup = { deletedCommentIds: [] as string[], resolvedThreadIds: [] as string[] };
+    const deleted = await svc.tombstoneComment(
+      commentId,
+      {
+        actorType: actor.actorType,
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+        runId: actor.runId,
+      },
+      {
+        afterTombstone: async (deletedComment, tx) => {
+          await issueReferencesSvc.syncComment(deletedComment.id, tx);
+          annotationCleanup = await documentAnnotationsSvc.cleanupForIssueCommentDeletion(issue.id, deletedComment.id, {
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+            runId: actor.runId,
+          }, tx);
+          await Promise.all(
+            annotationCleanup.deletedCommentIds.map((annotationCommentId) =>
+              issueReferencesSvc.deleteCommentSource(annotationCommentId, tx)
+            ),
+          );
+        },
+      },
+    );
+    if (!deleted) {
       res.status(404).json({ error: "Comment not found" });
       return;
     }
@@ -5643,20 +5731,25 @@ export function issueRoutes(
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
-      action: "issue.comment_cancelled",
+      action: "issue.comment_deleted",
       entityType: "issue",
       entityId: issue.id,
       details: {
-        commentId: removed.id,
-        bodySnippet: removed.body.slice(0, 120),
+        commentId: deleted.id,
         identifier: issue.identifier,
         issueTitle: issue.title,
-        source: "queue_cancel",
-        queueTargetRunId: activeRun.id,
+        source: "author_delete",
+        deletedByType: actor.actorType,
+        deletedByAgentId: actor.actorType === "agent" ? actor.agentId : null,
+        deletedByUserId: actor.actorType === "user" ? actor.actorId : null,
+        deletedByRunId: actor.runId,
+        deletedAt: deleted.deletedAt,
+        deletedAnnotationCommentIds: annotationCleanup.deletedCommentIds,
+        resolvedAnnotationThreadIds: annotationCleanup.resolvedThreadIds,
       },
     });
 
-    res.json(removed);
+    res.json(deleted);
   });
 
   router.get("/issues/:id/feedback-votes", async (req, res) => {
