@@ -57,6 +57,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableIsolatedWorkspaces: false,
     enableStreamlinedLeftNavigation: true,
     enablePipelines: false,
+    enableCases: false,
     enableConferenceRoomChat: false,
     enableIssuePlanDecompositions: false,
     enableExperimentalFileViewer: false,
@@ -69,7 +70,8 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     autoRestartDevServerWhenIdle: false,
     enableIssueGraphLivenessAutoRecovery: false,
     issueGraphLivenessAutoRecoveryLookbackHours: 24,
-    enableWorkspaceBranchReconcileForward: false,
+    enableWorkspaceBranchReconcileForward: true,
+    enableWorkspaceDirtyQuarantineRepair: true,
     enableWorktreeRunExecution: false,
   };
 }

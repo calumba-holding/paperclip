@@ -101,6 +101,7 @@ import {
   responsibleUserLabel,
 } from "@paperclipai/shared";
 import { ResponsibleUserDenialNotice } from "../components/ResponsibleUserDenialNotice";
+import { RunWorkspaceRecoverySurface } from "../components/RunWorkspaceRecoverySurface";
 import { buildPermissionsForTrustPreset, getTrustPreset } from "../lib/trust-policy-ui";
 import { redactHomePathUserSegments, redactHomePathUserSegmentsInValue } from "@paperclipai/adapter-utils";
 import { agentRouteRef } from "../lib/utils";
@@ -176,6 +177,17 @@ function redactEnvValue(key: string, value: unknown, censorUsernameInLogs: boole
 
 function isMarkdown(pathValue: string) {
   return pathValue.toLowerCase().endsWith(".md");
+}
+
+function shouldUseMarkdownInstructionsEditor(input: {
+  selectedFileExists: boolean;
+  selectedPath: string;
+  detail?: { markdown?: boolean } | null;
+  summary?: { markdown?: boolean } | null;
+}) {
+  const metadataMarkdown = input.detail?.markdown ?? input.summary?.markdown;
+  if (typeof metadataMarkdown === "boolean") return metadataMarkdown;
+  return isMarkdown(input.selectedPath);
 }
 
 function formatEnvForDisplay(envValue: unknown, censorUsernameInLogs: boolean): string {
@@ -1950,7 +1962,7 @@ function ConfigurationTab({
 
 /* ---- Prompts Tab ---- */
 
-function PromptsTab({
+export function PromptsTab({
   agent,
   companyId,
   onDirtyChange,
@@ -2189,6 +2201,12 @@ function PromptsTab({
 
   const currentContent = selectedFileExists ? (selectedFileDetail?.content ?? "") : "";
   const displayValue = draft ?? currentContent;
+  const useMarkdownEditor = shouldUseMarkdownInstructionsEditor({
+    selectedFileExists,
+    selectedPath: selectedOrEntryFile,
+    detail: selectedFileDetail,
+    summary: selectedFileSummary,
+  });
   const bundleDirty = Boolean(
     bundleDraft &&
       (
@@ -2663,14 +2681,14 @@ function PromptsTab({
 
           {selectedFileExists && fileLoading && !selectedFileDetail ? (
             <PromptEditorSkeleton />
-          ) : isMarkdown(selectedOrEntryFile) ? (
+          ) : useMarkdownEditor ? (
             <MarkdownEditor
               key={selectedOrEntryFile}
               value={displayValue}
               onChange={(value) => setDraft(value ?? "")}
               placeholder="# Agent instructions"
               className="min-w-0 overflow-hidden"
-              contentClassName="min-h-(--sz-420px) max-w-full break-words text-sm font-mono"
+              contentClassName="min-h-(--sz-420px) max-w-full break-words text-sm leading-7"
               imageUploadHandler={async (file) => {
                 const namespace = `agents/${agent.id}/instructions/${selectedOrEntryFile.replaceAll("/", "-")}`;
                 const asset = await uploadMarkdownImage.mutateAsync({ file, namespace });
@@ -3049,6 +3067,10 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
 
   return (
     <div className="space-y-4 min-w-0">
+      {/* Workspace-validation recovery: surfaces the recovery card when this run was declined over a
+          git workspace it could not validate, wired to the same reconcile / repair / re-issue /
+          break-glass handlers as the task detail page. */}
+      <RunWorkspaceRecoverySurface run={run} />
       {/* Run summary card */}
       <div className="border border-border rounded-lg overflow-hidden">
         <div className="flex flex-col sm:flex-row">
