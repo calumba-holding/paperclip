@@ -169,6 +169,7 @@ describe("Daytona sandbox provider plugin", () => {
         reuseLease: true,
         archiveOnRelease: false,
         useSessions: false,
+        useLogStream: false,
       },
     });
   });
@@ -1202,7 +1203,7 @@ describe("Daytona sandbox provider plugin", () => {
 
       // The provision command runs before the run opens its trace root, so the
       // host marks it `bypassSession`. The provider must not open the session for
-      // it, or the `session.setup` span loses its run parent.
+      // it, or the `session.open` span loses its run parent.
       await plugin.definition.onEnvironmentExecute?.(
         sessionExecParams({ bypassSession: true }),
       );
@@ -1406,7 +1407,7 @@ describe("Daytona sandbox provider plugin", () => {
       expect(sandbox.process.deleteSession).toHaveBeenCalledWith(sessionId);
     });
 
-    it("emits a session.setup span on create and a session.teardown span on delete", async () => {
+    it("emits a session.open span on create and a session.close span on delete", async () => {
       process.env.DAYTONA_API_KEY = "host-key";
       const sandbox = createMockSandbox();
       mockGet.mockResolvedValue(sandbox);
@@ -1414,7 +1415,7 @@ describe("Daytona sandbox provider plugin", () => {
       const restore = __setDaytonaPluginContextForTest({ tracer } as unknown as PluginContext);
       try {
         await plugin.definition.onEnvironmentExecute?.(sessionExecParams());
-        const setup = spans.find((span) => span.name === "session.setup");
+        const setup = spans.find((span) => span.name === "session.open");
         expect(setup).toBeDefined();
         expect(setup!.ended).toBe(true);
         expect(setup!.attributes["paperclip.sandbox.startup.provider"]).toBe("daytona");
@@ -1426,7 +1427,7 @@ describe("Daytona sandbox provider plugin", () => {
           providerLeaseId: "sandbox-123",
           config: { timeoutMs: 300000, reuseLease: false, useSessions: true },
         });
-        const teardown = spans.find((span) => span.name === "session.teardown");
+        const teardown = spans.find((span) => span.name === "session.close");
         expect(teardown).toBeDefined();
         expect(teardown!.ended).toBe(true);
         expect(teardown!.attributes["paperclip.sandbox.startup.provider"]).toBe("daytona");
@@ -1435,7 +1436,7 @@ describe("Daytona sandbox provider plugin", () => {
       }
     });
 
-    it("marks the session.setup span failed when the session create throws", async () => {
+    it("marks the session.open span failed when the session create throws", async () => {
       process.env.DAYTONA_API_KEY = "host-key";
       const sandbox = createMockSandbox();
       sandbox.process.createSession.mockRejectedValueOnce(new Error("create boom"));
@@ -1446,7 +1447,7 @@ describe("Daytona sandbox provider plugin", () => {
         await expect(
           plugin.definition.onEnvironmentExecute?.(sessionExecParams()),
         ).rejects.toThrow(/create boom/);
-        const setup = spans.find((span) => span.name === "session.setup");
+        const setup = spans.find((span) => span.name === "session.open");
         expect(setup).toBeDefined();
         expect(setup!.ended).toBe(true);
         expect(setup!.status?.code).toBe(2);
@@ -1532,6 +1533,141 @@ describe("Daytona sandbox provider plugin", () => {
 
       expect(result).toMatchObject({ exitCode: null, timedOut: true });
       expect(result!.stderr).toMatch(/timed out/);
+    });
+
+    describe("log stream (useLogStream)", () => {
+      // A session exec params helper with the log-stream flag on. It streams
+      // stdout and stderr from the callback log form instead of the 50-ms poll.
+      const streamExecParams = (overrides: Record<string, unknown> = {}) =>
+        sessionExecParams({
+          config: { timeoutMs: 300000, reuseLease: false, useSessions: true, useLogStream: true },
+          ...overrides,
+        });
+
+      it("streams ordered stdout and stderr from the callback log form (test_log_stream_delivers_ordered_chunks)", async () => {
+        process.env.DAYTONA_API_KEY = "host-key";
+        const sandbox = createMockSandbox();
+        sandbox.process.getSessionCommand.mockResolvedValue({ id: "cmd-1", command: "", exitCode: 0 });
+        // The callback form emits stdout and stderr chunks in order. The plugin
+        // keeps each stream in its own arrival order.
+        sandbox.process.getSessionCommandLogs.mockImplementation(
+          async (
+            _sid: string,
+            _cmdId: string,
+            onStdout?: (chunk: string) => void,
+            onStderr?: (chunk: string) => void,
+          ) => {
+            onStdout?.("out-1;");
+            onStderr?.("err-1;");
+            onStdout?.("out-2;");
+            onStderr?.("err-2;");
+          },
+        );
+        mockGet.mockResolvedValue(sandbox);
+
+        const result = await plugin.definition.onEnvironmentExecute?.(streamExecParams());
+
+        // The callback stream form ran (four args), not the 50-ms snapshot poll.
+        expect(sandbox.process.getSessionCommandLogs).toHaveBeenCalledTimes(1);
+        const streamCall = sandbox.process.getSessionCommandLogs.mock.calls[0]!;
+        expect(typeof streamCall[2]).toBe("function");
+        expect(typeof streamCall[3]).toBe("function");
+        expect(result).toMatchObject({
+          exitCode: 0,
+          timedOut: false,
+          stdout: "out-1;out-2;",
+          stderr: "err-1;err-2;",
+        });
+        expect(typeof (result!.metadata as Record<string, unknown>)?.durationMs).toBe("number");
+      });
+
+      it("reads the exit code once after the stream ends (test_log_stream_reads_exit_code_once_after_stream_end)", async () => {
+        process.env.DAYTONA_API_KEY = "host-key";
+        const sandbox = createMockSandbox();
+        sandbox.process.getSessionCommand.mockResolvedValue({ id: "cmd-1", command: "", exitCode: 5 });
+        sandbox.process.getSessionCommandLogs.mockImplementation(
+          async (_sid: string, _cmdId: string, onStdout?: (chunk: string) => void) => {
+            onStdout?.("done");
+          },
+        );
+        mockGet.mockResolvedValue(sandbox);
+
+        const result = await plugin.definition.onEnvironmentExecute?.(streamExecParams());
+
+        // The exit code read runs one time after the stream promise resolves.
+        expect(sandbox.process.getSessionCommand).toHaveBeenCalledTimes(1);
+        expect(result).toMatchObject({ exitCode: 5, timedOut: false, stdout: "done" });
+      });
+
+      it("falls back to the poll path when the stream promise rejects (test_log_stream_disconnect_rejects_and_falls_back_to_poll)", async () => {
+        process.env.DAYTONA_API_KEY = "host-key";
+        const sandbox = createMockSandbox();
+        // The callback form disconnects and rejects. The snapshot form (no
+        // callbacks) serves the poll fallback read.
+        sandbox.process.getSessionCommandLogs.mockImplementation(
+          async (
+            _sid: string,
+            _cmdId: string,
+            onStdout?: (chunk: string) => void,
+          ) => {
+            if (onStdout) {
+              onStdout("partial");
+              throw new Error("socket error");
+            }
+            return { stdout: "poll-out", stderr: "poll-err" };
+          },
+        );
+        // The command still runs to its exit on the server, so the poll reads it.
+        sandbox.process.getSessionCommand.mockResolvedValue({ id: "cmd-1", command: "", exitCode: 9 });
+        mockGet.mockResolvedValue(sandbox);
+
+        const result = await plugin.definition.onEnvironmentExecute?.(streamExecParams());
+
+        // The poll fallback served the final result, and the command still
+        // yielded its exit code.
+        expect(result).toMatchObject({ exitCode: 9, timedOut: false, stdout: "poll-out", stderr: "poll-err" });
+        // The snapshot form (two args) ran for the fallback read.
+        const snapshotCalls = sandbox.process.getSessionCommandLogs.mock.calls.filter(
+          (call) => call[2] === undefined,
+        );
+        expect(snapshotCalls.length).toBeGreaterThanOrEqual(1);
+      });
+
+      it("drops the replayed prefix by byte offset on a reconnect (test_log_stream_reconnect_drops_replayed_prefix_by_byte_offset)", async () => {
+        process.env.DAYTONA_API_KEY = "host-key";
+        const sandbox = createMockSandbox();
+        let attempt = 0;
+        sandbox.process.getSessionCommandLogs.mockImplementation(
+          async (
+            _sid: string,
+            _cmdId: string,
+            onStdout?: (chunk: string) => void,
+            onStderr?: (chunk: string) => void,
+          ) => {
+            attempt += 1;
+            if (attempt === 1) {
+              // First connection: deliver a prefix, then the socket drops.
+              onStdout?.("AAA");
+              onStderr?.("EEE");
+              throw new Error("socket error");
+            }
+            // Reconnect: Daytona replays the whole log from byte 0, then the new
+            // tail. The plugin must drop the replayed prefix.
+            onStdout?.("AAA");
+            onStdout?.("BBB");
+            onStderr?.("EEE");
+            onStderr?.("FFF");
+          },
+        );
+        sandbox.process.getSessionCommand.mockResolvedValue({ id: "cmd-1", command: "", exitCode: 0 });
+        mockGet.mockResolvedValue(sandbox);
+
+        const result = await plugin.definition.onEnvironmentExecute?.(streamExecParams());
+
+        // The pre-disconnect bytes appear one time, not two.
+        expect(result).toMatchObject({ exitCode: 0, timedOut: false, stdout: "AAABBB", stderr: "EEEFFF" });
+        expect(sandbox.process.getSessionCommandLogs).toHaveBeenCalledTimes(2);
+      });
     });
   });
 
@@ -3028,7 +3164,7 @@ describe("daytona native file-sync hooks", () => {
     expect(transfer!.attributes["paperclip.sandbox.startup.transfer.guard.count"]).toBe(2);
   });
 
-  it("opens mkdir, guard, transfer, rename spans in call order for a file-mapping sync", async () => {
+  it("opens ensureDirectory, checkSymlinkEscape, transfer, promote spans in call order for a file-mapping sync", async () => {
     const hostDir = await makeHostDir();
     const source = path.join(hostDir, "config.txt");
     await fs.writeFile(source, "plain");
@@ -3055,21 +3191,26 @@ describe("daytona native file-sync hooks", () => {
       restore();
     }
 
-    expect(spans.map((span) => span.name)).toEqual(["mkdir", "guard", "transfer", "rename"]);
+    expect(spans.map((span) => span.name)).toEqual([
+      "ensureDirectory",
+      "checkSymlinkEscape",
+      "transfer",
+      "promote",
+    ]);
     for (const span of spans) {
       expect(span.ended).toBe(true);
       expect(span.attributes["paperclip.sandbox.startup.provider"]).toBe("daytona");
       // A per-round-trip span carries no `*.wall_ms` attribute; the native span
       // width carries its time. Only `pack` and `transfer` keep a wall_ms value.
       if (span.name !== "transfer") {
-        expect(span.attributes["paperclip.sandbox.startup.mkdir.wall_ms"]).toBeUndefined();
-        expect(span.attributes["paperclip.sandbox.startup.rename.wall_ms"]).toBeUndefined();
-        expect(span.attributes["paperclip.sandbox.startup.guard.wall_ms"]).toBeUndefined();
+        expect(span.attributes["paperclip.sandbox.startup.ensureDirectory.wall_ms"]).toBeUndefined();
+        expect(span.attributes["paperclip.sandbox.startup.promote.wall_ms"]).toBeUndefined();
+        expect(span.attributes["paperclip.sandbox.startup.checkSymlinkEscape.wall_ms"]).toBeUndefined();
       }
     }
   });
 
-  it("opens pack, mkdir, guard, transfer, extract spans in call order for a directory-mapping sync", async () => {
+  it("opens pack, ensureDirectory, checkSymlinkEscape, transfer, extractTarball spans in call order for a directory-mapping sync", async () => {
     const hostDir = await makeHostDir();
     const sourceDir = path.join(hostDir, "assets");
     await fs.mkdir(sourceDir, { recursive: true });
@@ -3099,7 +3240,13 @@ describe("daytona native file-sync hooks", () => {
       restore();
     }
 
-    expect(spans.map((span) => span.name)).toEqual(["pack", "mkdir", "guard", "transfer", "extract"]);
+    expect(spans.map((span) => span.name)).toEqual([
+      "pack",
+      "ensureDirectory",
+      "checkSymlinkEscape",
+      "transfer",
+      "extractTarball",
+    ]);
     for (const span of spans) {
       expect(span.attributes["paperclip.sandbox.startup.provider"]).toBe("daytona");
     }
@@ -3141,7 +3288,7 @@ describe("daytona native file-sync hooks", () => {
     expect(pack!.attributes["paperclip.sandbox.startup.provider"]).toBe("daytona");
   });
 
-  it("opens a guard span and a provision span in call order for a post-upload command with a working directory", async () => {
+  it("opens a checkSymlinkEscape span and a postUploadCommand span in call order for a post-upload command with a working directory", async () => {
     const hostDir = await makeHostDir();
     const source = path.join(hostDir, "config.txt");
     await fs.writeFile(source, "plain");
@@ -3169,17 +3316,18 @@ describe("daytona native file-sync hooks", () => {
       restore();
     }
 
-    // The full order: the file mapping opens mkdir, guard, transfer, rename; the
-    // post-upload command then opens its own cwd guard and the provision span.
+    // The full order: the file mapping opens ensureDirectory, checkSymlinkEscape,
+    // transfer, promote; the post-upload command then opens its own cwd
+    // checkSymlinkEscape and the postUploadCommand span.
     expect(spans.map((span) => span.name)).toEqual([
-      "mkdir",
-      "guard",
+      "ensureDirectory",
+      "checkSymlinkEscape",
       "transfer",
-      "rename",
-      "guard",
-      "provision",
+      "promote",
+      "checkSymlinkEscape",
+      "postUploadCommand",
     ]);
-    const provision = spans.find((span) => span.name === "provision");
+    const provision = spans.find((span) => span.name === "postUploadCommand");
     expect(provision!.ended).toBe(true);
     expect(provision!.attributes["paperclip.sandbox.startup.provider"]).toBe("daytona");
   });
