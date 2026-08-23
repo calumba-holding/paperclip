@@ -70,7 +70,10 @@ import {
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
-import { getStartupTraceContext } from "../instrumentation.js";
+import { getStartupTraceContext, getStartupTracer } from "../instrumentation.js";
+import { createHostDuplexTelemetryRecorder } from "./duplex-telemetry-recorder.js";
+import type { DuplexAggregateByteLedger } from "@paperclipai/adapter-utils/duplex-aggregate-byte-ledger";
+import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
 import {
   createGitRemoteAuthProvider,
@@ -6690,6 +6693,14 @@ export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
+  /**
+   * The process-owned aggregate byte ledger for the sandbox duplex channel. The
+   * server root creates one ledger per host process and injects the same object
+   * here. The heartbeat threads it into the environment run orchestrator, which
+   * stamps it onto the sandbox execution target. Absent keeps the bridge inert
+   * for this seam.
+   */
+  duplexAggregateByteLedger?: DuplexAggregateByteLedger | null;
 }
 
 type WorkspaceReadyCommentWriter = {
@@ -6813,6 +6824,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const envOrchestrator = environmentRunOrchestrator(db, {
     pluginWorkerManager: options.pluginWorkerManager,
     environmentRuntime,
+    duplexAggregateByteLedger: options.duplexAggregateByteLedger,
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const liveRunExecutions = {
@@ -15345,6 +15357,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       lease: acquiredEnvironment.lease,
       leaseContext: acquiredEnvironment.leaseContext,
     };
+    // The host duplex telemetry recorder for this run. It binds the fixed duplex
+    // observability surface to real sinks: the spans to the OTel tracer, the
+    // guarded counters to the tool-runtime metric store, and the transport event
+    // to the run-event path. Each sink runs guarded and fire-and-forget, so a
+    // telemetry failure never breaks the run. The orchestrator stamps it on the
+    // sandbox target; a non-duplex run keeps the safe no-op default in the bridge.
+    const duplexTelemetryRecorder = createHostDuplexTelemetryRecorder({
+      tracer: getStartupTracer(),
+      incrementCounter: (metric) => {
+        void incrementToolRuntimeMetricCounter(db, {
+          companyId: run.companyId,
+          metric,
+        }).catch(() => {});
+      },
+      emitTransportEvent: (event) => {
+        void (async () => {
+          const eventRun = run;
+          const seq = await nextRunEventSeq(eventRun.id);
+          await appendRunEvent(eventRun, seq, {
+            eventType: event.name,
+            stream: "system",
+            level: event.dimensions.outcome === "error" ? "warn" : "info",
+            payload: { ...event.dimensions },
+          });
+        })().catch(() => {});
+      },
+    });
     const realizationResult = await envOrchestrator.realizeForRun({
       environment: selectedEnvironment,
       lease: activeEnvironmentLease.lease,
@@ -15355,6 +15394,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       executionWorkspace,
       effectiveExecutionWorkspaceMode,
       persistedExecutionWorkspace,
+      duplexTelemetryRecorder,
     });
     activeEnvironmentLease = {
       ...activeEnvironmentLease,
@@ -17445,7 +17485,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             previousStatus: issue.status,
             notice: buildExecutionReviewParticipantRecoveryNoticeSeed(),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
-            recoveryOwnerAgentId: currentParticipant.agentId,
           };
         }
 
@@ -17701,7 +17740,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : promotionResult.recoveryCause === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
                 ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
               : undefined,
-        recoveryOwnerAgentId: promotionResult.recoveryOwnerAgentId,
       });
       return;
     }
