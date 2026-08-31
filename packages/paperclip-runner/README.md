@@ -111,6 +111,17 @@ validate retained identity and schema, require the exact sidecar
 acknowledgement, and only then clear pending local state. Codex permission
 requests violate its pinned sidecar policy and terminate the session fail
 closed.
+Safe suspension is available only with no active turn or pending request. The
+sidecar must return the exact persistent session identity before runnerd
+terminates the local process.
+Already validated ACPX reducer events project into provider-neutral durable
+events only with an exact run, session, turn, and item binding. Raw sidecar
+envelopes and permission requests are not admitted at this boundary.
+A safely suspended session can be recorded as a bounded private checkpoint.
+The checkpoint binds the exact provider identity, run, catalog revision, and
+catalog digest and is replaced atomically before a later recovery attempt.
+Recovery releases the stored identity only after those bindings match the
+prospective session configuration exactly.
 
 Run the complete contract gate with:
 

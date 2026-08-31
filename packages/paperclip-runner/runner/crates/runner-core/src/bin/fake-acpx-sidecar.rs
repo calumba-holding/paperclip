@@ -4,6 +4,8 @@ use std::time::Duration;
 use paperclip_runner_core::generated_acpx_sidecar_contract::GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION;
 use serde_json::{json, Value};
 
+const PROJECTED_INPUT_PROVIDER_ID: &str = "input / réquest";
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("fake-acpx-sidecar: {error}");
@@ -110,7 +112,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             | "turns-permission"
             | "resolutions"
             | "resolutions-error-redaction"
-            | "resolutions-wrong-ack" => {
+            | "resolutions-projected-id"
+            | "resolutions-wrong-ack"
+            | "suspend"
+            | "suspend-wrong-ack"
+            | "suspend-wrong-identity"
+            | "suspend-missing-identity" => {
                 write_json(&mut stdout, &bootstrap_success(id, command, &request, mode))?;
                 let params = request.get("params").unwrap_or(&Value::Null);
                 let turn_id = params
@@ -450,7 +457,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if command == "turn.start"
                     && matches!(
                         mode,
-                        "resolutions" | "resolutions-error-redaction" | "resolutions-wrong-ack"
+                        "resolutions"
+                            | "resolutions-error-redaction"
+                            | "resolutions-projected-id"
+                            | "resolutions-wrong-ack"
                     )
                 {
                     for (event_type, payload) in [
@@ -465,7 +475,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         (
                             "runtime.input_requested",
                             json!({
-                                "requestId":"input-1",
+                                "requestId":if mode == "resolutions-projected-id" {
+                                    PROJECTED_INPUT_PROVIDER_ID
+                                } else {
+                                    "input-1"
+                                },
                                 "questionSet":{
                                     "schema":"paperclip.question_set.v1",
                                     "questions":[{
@@ -571,10 +585,10 @@ fn bootstrap_success(id: u64, command: &str, request: &Value, mode: &str) -> Val
         }),
         "turn.cancel" => json!({"cancelled":mode != "turns-wrong-cancel"}),
         "session.suspend" => json!({
-            "suspended":true,
-            "identity": {
+            "suspended":mode != "suspend-wrong-ack",
+            "identity": if mode == "suspend-missing-identity" { Value::Null } else { json!({
                 "kind": "acpx",
-                "normalizedSessionId": "session-1",
+                "normalizedSessionId": if mode == "suspend-wrong-identity" { "another-session" } else { "session-1" },
                 "acpxRecordId": "record-1",
                 "backendSessionId": "backend-1",
                 "agentSessionId": "agent-1",
@@ -583,7 +597,7 @@ fn bootstrap_success(id: u64, command: &str, request: &Value, mode: &str) -> Val
                 "requestedModel": "gpt-5.6-sol",
                 "effectiveModel": "gpt-5.6-sol",
                 "permissionMode": "approve-reads",
-            },
+            })},
         }),
         "tool.resolve" => json!({
             "resolved":if mode == "resolutions-error-redaction" {
@@ -597,7 +611,11 @@ fn bootstrap_success(id: u64, command: &str, request: &Value, mode: &str) -> Val
                 mode != "resolutions-wrong-ack"
             }
         }),
-        "input.resolve" => json!({"resolved":true}),
+        "input.resolve" => json!({
+            "resolved": mode != "resolutions-projected-id"
+                || params.get("requestId").and_then(Value::as_str)
+                    == Some(PROJECTED_INPUT_PROVIDER_ID),
+        }),
         "session.close" => json!({"closed":true}),
         _ => json!({"command":command,"params":params}),
     };
