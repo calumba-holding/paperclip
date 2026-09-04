@@ -31,6 +31,7 @@ import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 type BackendFactoryOptions = {
   runnerInstanceId?: string;
   acpxRuntimeDirectory?: string;
+  workingDirectoryAuthority?: "local_filesystem" | "remote_runner";
   codexTransportFactory?: () => unknown;
   dynamicToolHandler?: (call: unknown) => Promise<unknown>;
   onSpawn?: (meta: {
@@ -165,6 +166,7 @@ import {
   runtimeQuestionFallbackFromEvent,
   resolveNativeRuntimeRequest,
   resolveNativeHarnessPersistenceProfile,
+  runnerdStateProvesIncompleteBootstrap,
   semanticProviderPlanMarkdown,
   sha256DirectoryTree,
   stageRemoteRunnerDirectory,
@@ -173,6 +175,46 @@ import {
   verifyNativeHarnessBackup,
   shouldRestoreNativeHarnessBackupIntoSandbox,
 } from "./native-session-executor.js";
+
+describe("native incomplete-bootstrap evidence", () => {
+  it("requires zero connections, zero events, and only untouched bootstrap commands", async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-bootstrap-evidence-"));
+    const controlPlaneRoot = join(root, "control-plane");
+    await mkdir(controlPlaneRoot, { recursive: true });
+    const statePath = join(controlPlaneRoot, "control-plane-state.json");
+    const base = {
+      schema: "paperclip.runner.durable.control-plane-state.v1",
+      connectionCount: 0,
+      committedEvents: [],
+      commands: [
+        { type: "run.prepare", status: "pending" },
+        { type: "session.open", status: "pending" },
+      ],
+    };
+    try {
+      await writeFile(statePath, JSON.stringify(base));
+      expect(runnerdStateProvesIncompleteBootstrap(root)).toBe(true);
+
+      for (const ambiguous of [
+        { ...base, connectionCount: 1 },
+        { ...base, committedEvents: [{ eventType: "harness.ready" }] },
+        {
+          ...base,
+          commands: [{ type: "session.open", status: "completed" }],
+        },
+        {
+          ...base,
+          commands: [{ type: "turn.start", status: "pending" }],
+        },
+      ]) {
+        await writeFile(statePath, JSON.stringify(ambiguous));
+        expect(runnerdStateProvesIncompleteBootstrap(root)).toBe(false);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("native provider usage normalization", () => {
   it("reads remote runner run-delta tokens and provider cost", () => {
@@ -250,11 +292,11 @@ describe("remote provider pack manifest", () => {
     const opencodeCommand = "#!/bin/sh\n";
     const opencodeExecutable = "opencode-binary\n";
     await writeFile(
-      join(root, "dist", "cli", "opencode-app-server-proxy.js"),
+      join(root, "dist", "cli", "opencode-app-server-proxy.cjs"),
       proxy,
     );
     await writeFile(
-      join(root, "dist", "cli", "acpx-runtime-sidecar.js"),
+      join(root, "dist", "cli", "acpx-runtime-sidecar.cjs"),
       sidecar,
     );
     await writeFile(join(root, "node_modules", "node", "bin", "node"), node);
@@ -288,7 +330,7 @@ describe("remote provider pack manifest", () => {
         claude:
           "sha256:9d73d1f0f121fb96cc8badb28c22d5bff02d8582eb2e40360a81c189e1b9422a",
         codex:
-          "sha256:94049b3e3c3aee87de62703786e4fa81d031d7bd979f99bdf516d84f28791a79",
+          "sha256:7a923b3829884d3cabcc9659d22cace3f86813e7bfffc90974b10140a45bc400",
       },
       artifacts: {
         nodeCommand: {
@@ -305,11 +347,11 @@ describe("remote provider pack manifest", () => {
           sha256: digest(opencodeExecutable),
         },
         opencodeProxy: {
-          path: "dist/cli/opencode-app-server-proxy.js",
+          path: "dist/cli/opencode-app-server-proxy.cjs",
           sha256: proxySha,
         },
         acpxSidecar: {
-          path: "dist/cli/acpx-runtime-sidecar.js",
+          path: "dist/cli/acpx-runtime-sidecar.cjs",
           sha256: sidecarSha,
         },
       },
@@ -352,14 +394,14 @@ describe("remote provider pack manifest", () => {
     }
     await writeManifest();
     await writeFile(
-      join(root, "dist", "cli", "opencode-app-server-proxy.js"),
+      join(root, "dist", "cli", "opencode-app-server-proxy.cjs"),
       "tampered\n",
     );
     expect(() => readRemoteProviderPackManifest(root)).toThrow(
       "OpenCode proxy digest mismatch",
     );
     await writeFile(
-      join(root, "dist", "cli", "opencode-app-server-proxy.js"),
+      join(root, "dist", "cli", "opencode-app-server-proxy.cjs"),
       proxy,
     );
     await writeFile(
@@ -3072,6 +3114,7 @@ describe("runnerd provider runtime wiring", () => {
         executionWorkspaceId: "run-projectless-next",
       },
     } as NativeExecutionInputV1;
+    const remoteCwd = "/home/daytona/paperclip-workspace";
     try {
       state.createBackend.mockClear();
       state.createTransport.mockClear();
@@ -3134,7 +3177,37 @@ describe("runnerd provider runtime wiring", () => {
         execution: continuation,
         runnerInstanceId: "runner-new-heartbeat",
         useRunnerd: true,
+        runnerExecutionTarget: {
+          kind: "remote",
+          transport: "ssh",
+          remoteCwd,
+          spec: {
+            host: "runner.internal",
+            port: 22,
+            username: "runner",
+            remoteWorkspacePath: remoteCwd,
+            remoteCwd,
+            privateKey: null,
+            knownHosts: null,
+            strictHostKeyChecking: true,
+          },
+        },
       });
+      expect(state.createBackend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workspace: expect.objectContaining({ cwd: remoteCwd }),
+        }),
+        expect.objectContaining({
+          workingDirectoryAuthority: "remote_runner",
+        }),
+      );
+      expect(state.execute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            workspace: expect.objectContaining({ cwd: remoteCwd }),
+          }),
+        }),
+      );
       const backendOptions = state.createBackend.mock.calls[0]![1];
       backendOptions.codexTransportFactory!();
       expect(state.createTransport).toHaveBeenCalledWith(
@@ -4601,7 +4674,9 @@ describe("runnerd provider runtime wiring", () => {
       expect.objectContaining({
         workspace: expect.objectContaining({ cwd: remoteCwd }),
       }),
-      expect.any(Object),
+      expect.objectContaining({
+        workingDirectoryAuthority: "remote_runner",
+      }),
     );
     expect(state.execute).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -4615,10 +4690,52 @@ describe("runnerd provider runtime wiring", () => {
     backendOptions.codexTransportFactory!();
     expect(state.createTransport).toHaveBeenCalledWith(
       expect.objectContaining({
+        runnerBinary: "/tmp/paperclip-runnerd",
         environment: expect.objectContaining({
           PAPERCLIP_WORKSPACE_CWD: remoteCwd,
         }),
       }),
+    );
+    expect(state.createTransport.mock.calls[0]![0].runnerBinary).not.toBe(
+      `${remoteCwd}/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd`,
+    );
+  });
+
+  it("binds a remote launch to the configured controller-owned runner artifact", async () => {
+    const remoteCwd = "/home/daytona/paperclip-workspace";
+    const controllerArtifact = "/controller/artifacts/paperclip-runnerd";
+    const remoteExecution = {
+      ...execution,
+      binding: { ...execution.binding, runId: "run-remote-runner-artifact" },
+      workspace: { ...execution.workspace, cwd: "/host/paperclip-workspace" },
+    } as NativeExecutionInputV1;
+
+    await createRunnerdBackend({
+      db: leaseDb(remoteExecution),
+      execution: remoteExecution,
+      runnerInstanceId: "runner",
+      runnerExecutionTarget: {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd,
+        spec: {
+          host: "runner.internal",
+          port: 22,
+          username: "runner",
+          remoteWorkspacePath: remoteCwd,
+          remoteCwd,
+          privateKey: null,
+          knownHosts: null,
+          strictHostKeyChecking: true,
+        },
+      },
+      runnerRemoteBinaryPath: controllerArtifact,
+    });
+
+    state.createTransport.mockClear();
+    state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    expect(state.createTransport).toHaveBeenCalledWith(
+      expect.objectContaining({ runnerBinary: controllerArtifact }),
     );
   });
 
