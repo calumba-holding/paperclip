@@ -209,8 +209,7 @@ export function Layout() {
   ) : sharedSecondarySidebar;
   const hasSecondarySidebar = secondarySidebar != null;
   const keepsPrimarySidebar = streamlinedUiEnabled && hasSecondarySidebar && (
-    shellRoute.builtInContextualSurface === "settings"
-    || shellRoute.builtInContextualSurface === "skills"
+    shellRoute.builtInContextualSurface === "skills"
     || shellRoute.builtInContextualSurface === "agent"
     || shellRoute.builtInContextualSurface === "routine"
     || isAppsRoute
@@ -660,8 +659,6 @@ export function Layout() {
             </div>
             <SidebarAccountMenu
               deploymentMode={health?.deploymentMode}
-              serverGit={health?.serverInfo?.git}
-              version={health?.version}
               forceExpanded={replacesPrimarySidebar}
             />
           </div>
@@ -685,8 +682,6 @@ export function Layout() {
             </div>
             <SidebarAccountMenu
               deploymentMode={health?.deploymentMode}
-              serverGit={health?.serverInfo?.git}
-              version={health?.version}
               forceExpanded={replacesPrimarySidebar}
             />
           </SidebarShell>
@@ -752,7 +747,7 @@ export function Layout() {
                 // The task thread owns its scrollable top spacing. Leaving the
                 // page shell's top padding in place creates a stationary dark
                 // strip below the breadcrumb while messages scroll behind it.
-                !isMobile && useStreamlinedTaskDetailShell && "pt-0 pr-0 md:pt-0 md:pr-0",
+                !isMobile && useStreamlinedTaskDetailShell && "pt-0 md:pt-0",
                 // Reserve the scrollbar gutter on desktop so pages whose height
                 // changes (e.g. switching skill-detail tabs) don't widen/shift
                 // when the vertical scrollbar appears or disappears (PAP-10907).
