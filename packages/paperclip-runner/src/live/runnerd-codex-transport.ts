@@ -937,7 +937,11 @@ export interface CapabilityRunnerdCodexTransportOptions {
   opencodeProxySha256?: string;
   opencodeRuntimeDirectory?: string;
   environment?: NodeJS.ProcessEnv;
+  /** Provider system instructions supplied by a native execution caller. */
+  baseInstructions?: string;
   closeGraceMs?: number;
+  /** Bounded provider turn-admission wait; defaults to 30 seconds. */
+  turnStartTimeoutMs?: number;
   onDiagnostic?: (message: string) => void;
   onEvidence?: (evidence: Readonly<CapabilityRunnerdProcessEvidence>) => void;
   stateDirectory?: string;
@@ -1549,7 +1553,10 @@ function resolveBuildOwnedCliArtifact(
   );
 }
 
-function acpxProviderPackageAuthority(sidecarScript: string): {
+function acpxProviderPackageAuthority(
+  sidecarScript: string,
+  ownerPackageRoot = packageRoot,
+): {
   root: string;
   manifest: string;
 } {
@@ -1564,12 +1571,25 @@ function acpxProviderPackageAuthority(sidecarScript: string): {
     );
   }
   const sidecarPackageRoot = resolve(cliDirectory, "../..");
-  // A local source build consumes pnpm's workspace-owned node_modules tree.
-  // A deployed provider pack owns a closed node_modules tree at its own root.
-  return sidecarPackageRoot === packageRoot
+  // A local source build lives at <workspace>/packages/paperclip-runner and
+  // resolves dependencies from <workspace>/node_modules. `pnpm deploy` makes
+  // the package itself the deployment root and owns <deploy>/node_modules/.pnpm.
+  // The older npm-installed portable shape nests the scoped package at
+  // <deploy>/node_modules/@paperclipai/paperclip-runner. The verifier always
+  // receives the directory that owns node_modules, regardless of which
+  // portable shape launched the already-authenticated sidecar.
+  const sourceDependencyRoot = resolve(ownerPackageRoot, "../..");
+  const localDependencyRoot = existsSync(
+      resolve(ownerPackageRoot, "node_modules", ".pnpm"),
+    )
+    ? ownerPackageRoot
+    : basename(sourceDependencyRoot) === "node_modules"
+      ? resolve(sourceDependencyRoot, "..")
+      : sourceDependencyRoot;
+  return sidecarPackageRoot === ownerPackageRoot
     ? {
-        root: resolve(packageRoot, "../.."),
-        manifest: resolve(packageRoot, "package.json"),
+        root: localDependencyRoot,
+        manifest: resolve(ownerPackageRoot, "package.json"),
       }
     : {
         root: sidecarPackageRoot,
@@ -3719,6 +3739,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   async #startTurn(
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    const turnStartTimeoutMs = this.options.turnStartTimeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(turnStartTimeoutMs) || turnStartTimeoutMs <= 0) {
+      throw new Error("turnStartTimeoutMs must be a positive safe integer");
+    }
+    const commandDeadline = Date.now() + turnStartTimeoutMs;
     const input = Array.isArray(params.input) ? params.input.map(record) : [];
     const message = input
       .map((item) => (typeof item.text === "string" ? item.text : ""))
@@ -3737,7 +3762,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       const startResult = await this.#commandResult("turn.start", {
         text: message,
         turnId: pendingTurnId,
-      });
+      }, commandDeadline);
       const expectedProviderTurnId =
         typeof startResult.providerTurnId === "string" &&
         startResult.providerTurnId.length > 0
@@ -3770,7 +3795,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // command's durable result so a delayed prior-turn event cannot satisfy
       // the new response fence. ACPX echoes the requested identity, while
       // Codex and OpenCode return their provider-assigned identity.
-      const deadline = Date.now() + 30_000;
+      const deadline = this.options.turnStartTimeoutMs === undefined
+        ? Date.now() + 30_000
+        : commandDeadline;
       const providerTurnStarted = () =>
         turnStartResponseReady({
           responseEpoch,
