@@ -243,6 +243,66 @@ it("preserves an explicit OpenCode permission mode at the runner spawn boundary"
   expect(launches[0]!.environment.PAPERCLIP_OPENCODE_COMMAND).toBeUndefined();
 });
 
+it("preserves only bounded GitHub credential projection at the runner spawn boundary", () => {
+  const launches: RunnerProcessLaunchSpec[] = [];
+  spawnRunner({
+    connection: { mode: "connect", connectUrl: "ws://127.0.0.1:43127" },
+    stateDirectory: "/tmp/paperclip-runner-test",
+    identity,
+    ticket: "bootstrap-ticket",
+    maxOutboxBytes: 256 * 1024,
+    p0ReserveBytes: 64 * 1024,
+    runnerVersion: expectedRunnerVersion,
+    runnerDigest: expectedRunnerDigest,
+    environment: {
+      PATH: "/bin",
+      GH_TOKEN: "github-token",
+      GITHUB_TOKEN: "github-token",
+      PAPERCLIP_GIT_TOKEN: "github-token",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "credential.https://github.com.helper",
+      GIT_CONFIG_VALUE_0: "!trusted-helper",
+      GIT_CONFIG_KEY_1: "must.not.cross",
+      GIT_CONFIG_VALUE_1: "must-not-cross",
+      PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "1",
+      DATABASE_URL: "must-not-cross",
+    },
+    processLauncher: (spec) => {
+      launches.push(spec);
+      return {
+        child: {
+          pid: 42,
+          exitCode: null,
+          signalCode: null,
+          kill: () => true,
+        },
+        completion: Promise.resolve({
+          code: 0,
+          signal: null,
+          stdout: "",
+          stderr: "",
+        }),
+      };
+    },
+  });
+
+  expect(launches).toHaveLength(1);
+  expect(launches[0]!.environment).toMatchObject({
+    GH_TOKEN: "github-token",
+    GITHUB_TOKEN: "github-token",
+    PAPERCLIP_GIT_TOKEN: "github-token",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "credential.https://github.com.helper",
+    GIT_CONFIG_VALUE_0: "!trusted-helper",
+    PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "1",
+  });
+  expect(launches[0]!.environment.GIT_CONFIG_KEY_1).toBeUndefined();
+  expect(launches[0]!.environment.GIT_CONFIG_VALUE_1).toBeUndefined();
+  expect(launches[0]!.environment.DATABASE_URL).toBeUndefined();
+});
+
 it("preserves the controller-selected ACPX provider package root", () => {
   const launches: RunnerProcessLaunchSpec[] = [];
   spawnRunner({
@@ -1043,6 +1103,15 @@ describe.sequential("DurablePrpControlPlane", () => {
         controlPlane,
         controlPlane.issueBootstrapTicket(),
       );
+      const nextAuthorityCommand = controlPlane.queueCommand(
+        "runner.drain",
+        {},
+        "command-after-suspend-1",
+        true,
+      );
+      expect(
+        controlPlane.store.state.commandDeliveryCounts[command.commandId],
+      ).toBe(1);
       const terminalResult = {
         protocol: "paperclip.runner",
         version: 1,
@@ -1068,7 +1137,13 @@ describe.sequential("DurablePrpControlPlane", () => {
       });
       expect(controlPlane.store.state.commands).toMatchObject([
         { commandId: "command-suspend-1", status: "completed" },
+        { commandId: "command-after-suspend-1", status: "pending" },
       ]);
+      expect(
+        controlPlane.store.state.commandDeliveryCounts[
+          nextAuthorityCommand.commandId
+        ],
+      ).toBeUndefined();
 
       sendSecure(client!, terminalResult);
       await expect(receiveSecure(client!)).resolves.toMatchObject({
@@ -1076,7 +1151,22 @@ describe.sequential("DurablePrpControlPlane", () => {
         payload: { commandId: "command-suspend-1" },
       });
       expect(controlPlane.store.state.duplicateCommandResults).toBe(1);
+      expect(
+        controlPlane.store.state.commandDeliveryCounts[
+          nextAuthorityCommand.commandId
+        ],
+      ).toBeUndefined();
+      const leaseToken = client!.leaseToken!;
       client?.socket.destroy();
+      const successor = await authenticate(controlPlane, leaseToken);
+      expect(successor?.welcome.payload).toMatchObject({
+        pendingCommands: [
+          expect.objectContaining({
+            commandId: nextAuthorityCommand.commandId,
+          }),
+        ],
+      });
+      successor?.socket.destroy();
     } finally {
       await controlPlane.stop();
       rmSync(root, { recursive: true, force: true });
